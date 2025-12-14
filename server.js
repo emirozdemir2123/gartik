@@ -1,4 +1,3 @@
-// Gerekli kütüphaneleri dahil ediyoruz
 const express = require('express');
 const http = require('http');
 const socketIo = require('socket.io');
@@ -6,344 +5,223 @@ const path = require('path');
 
 const app = express();
 const server = http.createServer(app);
-const io = socketIo(server); 
+// Render uyumlu CORS ayarı
+const io = socketIo(server, {
+    cors: {
+        origin: "*", 
+        methods: ["GET", "POST"]
+    }
+}); 
 
 // --- SABİTLER ve OYUN DEĞİŞKENLERİ ---
 const MAX_PLAYERS_PER_ROOM = 10;
-const ROUND_DURATION = 60; // Saniye
-const WORDS = [
-    "köpek", "ev", "bilgisayar", "güneş", "telefon", "ayakkabı",
-    "gözlük", "araba", "masa", "bardak", "sandalye", "bulut",
-    "kedi", "ağaç", "deniz", "kitap"
-];
+const ROUND_DURATION = 60;
+const WORDS = ["köpek","ev","bilgisayar","güneş","telefon","ayakkabı","gözlük","araba","masa","bardak","sandalye","bulut","kedi","ağaç","deniz","kitap"];
 
-const rooms = {}; 
+const rooms = {};
 
-function selectNewWord() {
-    const randomIndex = Math.floor(Math.random() * WORDS.length);
-    return WORDS[randomIndex];
+function randomWord() {
+  return WORDS[Math.floor(Math.random() * WORDS.length)];
 }
 
-function getRoomState(roomName) {
-    if (!rooms[roomName]) {
-        rooms[roomName] = {
-            currentWord: selectNewWord(),
-            drawerId: null,
-            history: [],
-            connections: {}, 
-            score: {}, // { 'socketId': 50, ... }
-            playerCount: 0,
-            timer: ROUND_DURATION,
-            interval: null, // Zamanlayıcı intervalini tutar
-            guessedPlayers: new Set() // Bu turda kelimeyi bilen oyuncular
-        };
-    }
-    return rooms[roomName];
+function getRoom(name) {
+  // Eğer oda yoksa, yeni bir oda oluşturur
+  if (!rooms[name]) {
+    rooms[name] = {
+      password: null, // Şifre (opsiyonel)
+      players: {}, // Oyuncu bilgileri (nick)
+      scores: {}, // Oyuncu skorları
+      drawer: null, // Şu an çizen
+      word: randomWord(),
+      timer: ROUND_DURATION,
+      interval: null,
+      guessed: new Set(),
+      history: [] // Çizim geçmişi
+    };
+  }
+  return rooms[name];
 }
 
 function updateLobby() {
-    const lobbyData = {};
-    for (const name in rooms) {
-        const room = rooms[name];
-        lobbyData[name] = {
-            playerCount: room.playerCount,
-            maxPlayers: MAX_PLAYERS_PER_ROOM,
-            drawer: room.drawerId ? room.connections[room.drawerId].nickname : "Boş"
+  const data = {};
+  for (const r in rooms) {
+    // Sadece aktif odaları lobide göster
+    if (Object.keys(rooms[r].players).length > 0) { 
+        data[r] = {
+            count: Object.keys(rooms[r].players).length,
+            max: MAX_PLAYERS_PER_ROOM,
+            locked: !!rooms[r].password
         };
     }
-    io.emit('lobby update', lobbyData); 
+  }
+  io.emit('lobby update', data);
 }
 
-// Zamanlayıcıyı başlatma fonksiyonu
-function startTimer(roomName) {
-    const room = getRoomState(roomName);
-    
-    // Önceki zamanlayıcıyı temizle
-    if (room.interval) {
-        clearInterval(room.interval);
-    }
-    
-    room.timer = ROUND_DURATION;
-    
-    // 1 saniyelik interval
-    room.interval = setInterval(() => {
-        room.timer--;
-        
-        // Odaya zamanlayıcı durumunu gönder
-        io.to(roomName).emit('timer update', room.timer);
-        
-        if (room.timer <= 0) {
-            clearInterval(room.interval);
-            
-            // Eğer kimse bilemediyse, çizen de puan alamaz
-            io.to(roomName).emit('system message', `Süre doldu! Kelime **${room.currentWord}** idi. Yeni tur başlıyor...`);
-            
-            // Turu bitir ve yeni tur başlat
-            startNewRound(roomName);
-        }
-    }, 1000);
-}
+function startRound(roomName) {
+  const room = rooms[roomName];
+  const ids = Object.keys(room.players);
+  if (ids.length < 2) {
+      io.to(roomName).emit('system', 'Oyun için en az 2 oyuncu gerekli.');
+      return;
+  }
 
-// Yeni tur başlatma fonksiyonu (Odaya özel)
-function startNewRound(roomName) {
-    const room = getRoomState(roomName);
-    
-    // Eğer sadece bir kişi varsa tur başlamasın
-    if (room.playerCount <= 1) {
-        room.drawerId = null;
-        if (room.interval) clearInterval(room.interval);
-        io.to(roomName).emit('system message', `Oyun için en az 2 oyuncu gerekli. Yeni oyuncu bekleniyor.`);
-        updateLeaderboard(roomName);
-        return;
-    }
-    
-    // --- TUR BAŞLANGICI ---
-    
-    room.currentWord = selectNewWord();
-    room.history = [];
-    room.guessedPlayers = new Set(); // Yeni turda tahmin edenleri temizle
-    io.to(roomName).emit('clear canvas'); 
+  // Tur hazırlıkları
+  room.word = randomWord();
+  room.guessed.clear();
+  room.history = [];
 
-    
-    // 1. Yeni Çizeni Belirle (Sıra mantığı: Şu anki çizenin sıradaki komşusu)
-    const ids = Object.keys(room.connections);
-    let nextDrawerId;
+  // Sıradaki çizenin belirlenmesi
+  const next = room.drawer ? ids[(ids.indexOf(room.drawer)+1)%ids.length] : ids[0];
+  room.drawer = next;
 
-    if (room.drawerId) {
-        // Mevcut çizenin dizideki indeksini bul
-        const currentIndex = ids.indexOf(room.drawerId);
-        // Bir sonraki indeksi seç (son oyuncu ise başa dön)
-        const nextIndex = (currentIndex + 1) % ids.length;
-        nextDrawerId = ids[nextIndex];
-    } else {
-        // İlk tur ise rastgele birini seç
-        nextDrawerId = ids[Math.floor(Math.random() * ids.length)]; 
-    }
+  io.to(roomName).emit('clear canvas');
 
-    room.drawerId = nextDrawerId;
-    
-    // Çizim durumlarını gönder
-    io.to(room.drawerId).emit('draw state', { isDrawer: true, word: room.currentWord });
-    
-    // Diğer tüm oyunculara izleme durumunu gönder
-    ids.forEach(id => {
-        if (id !== room.drawerId) {
-            io.to(id).emit('draw state', { isDrawer: false });
-        }
+  // Çizen ve tahmin eden rolleri atama
+  ids.forEach(id => {
+    io.to(id).emit('draw state', {
+      isDrawer: id === room.drawer,
+      word: id === room.drawer ? room.word : undefined
     });
+  });
 
-    // Genel oyun durumunu gönder
-    io.to(roomName).emit('game state', {
-        wordLength: room.currentWord.length,
-        drawer: room.connections[room.drawerId].nickname
-    });
-    
-    io.to(roomName).emit('system message', `Yeni Tur Başladı! Sıra **${room.connections[room.drawerId].nickname}**'da. Kelime: ${'_ '.repeat(room.currentWord.length)}`);
-    
-    updateLeaderboard(roomName);
-    startTimer(roomName); // Zamanlayıcıyı başlat
-    updateLobby(); 
-}
+  // Genel oyun durumunu gönderme
+  io.to(roomName).emit('game state', {
+    drawer: room.players[room.drawer].nick,
+    length: room.word.length
+  });
 
-// Puan Tablosunu güncelleme fonksiyonu
-function updateLeaderboard(roomName) {
-    const room = getRoomState(roomName);
-    const leaderboard = [];
-    
-    for (const id in room.connections) {
-        leaderboard.push({
-            nickname: room.connections[id].nickname,
-            score: room.score[id] || 0
-        });
+  // Zamanlayıcıyı başlatma
+  room.timer = ROUND_DURATION;
+  clearInterval(room.interval);
+  room.interval = setInterval(() => {
+    room.timer--;
+    io.to(roomName).emit('timer update', room.timer);
+    if (room.timer <= 0) {
+      clearInterval(room.interval);
+      io.to(roomName).emit('system', `Süre doldu! Kelime **${room.word}** idi.`);
+      startRound(roomName);
     }
-
-    // Skora göre sırala (yüksekten düşüğe)
-    leaderboard.sort((a, b) => b.score - a.score);
-    
-    io.to(roomName).emit('leaderboard update', leaderboard);
+  }, 1000);
 }
 
-
-// --- EXPRESS VE STATİK DOSYALAR ---
+// Statik dosyalar (public klasörü)
 app.use(express.static(path.join(__dirname, 'public')));
 
+// Ana sayfa
 app.get('/', (req, res) => {
-  res.sendFile(path.join(__dirname, 'public', 'index.html'));
+    res.sendFile(path.join(__dirname, 'public', 'index.html'));
 });
 
-// --- SOCKET.IO BAĞLANTILARI ---
-io.on('connection', (socket) => {
+// --- SOCKET.IO OLAYLARI ---
+io.on('connection', socket => {
+  updateLobby(); // Bağlanan her yeni kullanıcı lobiyi görsün
+
+  // 1. ODA OLUŞTURMA OLAYI
+  socket.on('create room', ({room, password, nick}) => {
+    if (rooms[room]) {
+      socket.emit('error msg', 'Oda zaten var. Lütfen farklı bir isim deneyin.');
+      return;
+    }
+    const r = getRoom(room);
+    r.password = password || null;
     
-    updateLobby(); 
+    // Oda oluşturulduktan sonra, bu socket'i katılma olayına yönlendirir.
+    socket.emit('join room', {room, password, nick});
+  });
+
+  // 2. ODAYA KATILMA OLAYI (Oluşturma da buradan devam eder)
+  socket.on('join room', ({room, password, nick}) => {
+    const r = getRoom(room);
     
-    socket.on('join room', (data) => {
-        const nickname = data.nickname;
-        const roomName = data.room;
+    // Şifre kontrolü
+    if (r.password && r.password !== password) {
+      socket.emit('error msg', 'Şifre yanlış!');
+      return;
+    }
 
-        if (!roomName || !nickname) {
-            socket.emit('join error', 'Geçersiz isim veya oda.');
-            return;
-        }
+    if (Object.keys(r.players).length >= MAX_PLAYERS_PER_ROOM) {
+      socket.emit('error msg', 'Oda dolu.');
+      return;
+    }
 
-        const room = getRoomState(roomName);
+    socket.join(room);
+    socket.room = room; // Socket objesine oda adını kaydet
+    socket.nick = nick; // Socket objesine nicki kaydet
 
-        if (room.playerCount >= MAX_PLAYERS_PER_ROOM) {
-            socket.emit('join error', `Oda (${roomName}) dolu. Maksimum ${MAX_PLAYERS_PER_ROOM} kişi.`);
-            return;
-        }
+    r.players[socket.id] = {nick};
+    r.scores[socket.id] = r.scores[socket.id] || 0;
 
-        // Odaya Katılma İşlemi
-        socket.join(roomName);
-        socket.nickname = nickname;
-        socket.room = roomName;
+    socket.emit('joined', room); // İstemciye başarılı katılımı bildir
+    io.to(room).emit('system', `${nick} odaya katıldı.`);
+    updateLobby();
 
-        room.connections[socket.id] = { nickname: nickname, id: socket.id };
-        room.score[socket.id] = room.score[socket.id] || 0; // Skoru sıfırla/başlat
-        room.playerCount++; 
+    // Eğer 2. kişi ise ve oyun başlamamışsa turu başlat
+    if (Object.keys(r.players).length === 2 && !r.drawer) startRound(room);
+  });
 
-        console.log(`${nickname} (${roomName}) bağlandı.`);
-        
-        socket.emit('joined', roomName);
+  // Diğer oyun olayları (draw, chat, disconnect, vs...)
+  socket.on('draw', d => {
+    const r = rooms[socket.room];
+    if (socket.id === r.drawer) {
+      r.history.push(d);
+      socket.to(socket.room).emit('draw', d);
+    }
+  });
 
-        io.to(socket.id).emit('drawing history', room.history);
-        
-        
-        // Oyun başlamıyorsa (ilk kişi)
-        if (room.playerCount === 1) {
-            io.to(roomName).emit('system message', `Oyunun başlaması için en az 2 oyuncu gerekiyor.`);
-        }
-        
-        // Eğer 2. kişi ise veya tur devam ediyorsa
-        if (room.playerCount >= 2 && room.drawerId === null) {
-            // İlk oyuncu bağlandıysa, turu hemen başlat
-            startNewRound(roomName);
-            return;
-        } 
-        
-        // Tur devam ediyorsa güncel durumu gönder
-        if (room.drawerId) {
-             // Yeni gelen çizense, kelimesini gönder
-            io.to(socket.id).emit('draw state', { 
-                isDrawer: socket.id === room.drawerId, 
-                word: socket.id === room.drawerId ? room.currentWord : undefined
-            });
-
-             // Genel oyun durumunu gönder
-            io.to(socket.id).emit('game state', {
-                wordLength: room.currentWord.length,
-                drawer: room.connections[room.drawerId].nickname
-            });
-            // Yeni gelen oyuncuya kalan süreyi gönder
-            io.to(socket.id).emit('timer update', room.timer);
-        }
-
-
-        io.to(roomName).emit('system message', `${nickname} oyuna katıldı.`);
-        updateLeaderboard(roomName);
-        updateLobby();
-    });
+  socket.on('chat', msg => {
+    const r = rooms[socket.room];
+    if (!r) return;
     
-    // Çizim Verilerini Senkronize Etme
-    socket.on('draw', (data) => {
-        if (!socket.room) return;
-        const room = getRoomState(socket.room);
-        if (socket.id === room.drawerId) { 
-            room.history.push(data);
-            socket.to(socket.room).emit('draw', data); 
-        }
-    });
+    const guess = msg.trim().toLowerCase();
+    const correctWord = r.word.toLowerCase();
+    
+    if (guess === correctWord && socket.id !== r.drawer) {
+      // Tahmin doğruysa
+      if (!r.guessed.has(socket.id)) { // Daha önce bilmediyse
+          r.scores[socket.id] += 5; // Bilene puan
+          r.scores[r.drawer] = (r.scores[r.drawer] || 0) + 3; // Çizene puan
+          r.guessed.add(socket.id); 
+          
+          io.to(socket.room).emit('system', `🎉 ${socket.nick} kelimeyi bildi!`);
+          
+          // Eğer çizen hariç herkes bildiyse
+          if (r.guessed.size === Object.keys(r.players).length - 1) {
+              clearInterval(r.interval);
+              io.to(socket.room).emit('system', `Tüm oyuncular bildi! Yeni tur başlıyor...`);
+              setTimeout(() => startRound(socket.room), 3000);
+          }
+          // Bilene özel mesaj (kelimeyi göstererek)
+          io.to(socket.id).emit('system', `Kelime **${r.word}** idi. +5 puan.`);
+      } else {
+          // Zaten bilmişse normal chat mesajı gibi göster
+          io.to(socket.room).emit('chat', `${socket.nick}: ${msg}`);
+      }
+    } else {
+      // Yanlış tahmin veya çizenin mesajı
+      io.to(socket.room).emit('chat', `${socket.nick}: ${msg}`);
+    }
+  });
 
-    // Tuvali Temizleme İsteğini İşleme
-    socket.on('clear canvas', () => {
-        if (!socket.room) return;
-        const room = getRoomState(socket.room);
-        if (socket.id === room.drawerId) { 
-            room.history = [];
-            io.to(socket.room).emit('clear canvas'); 
-        }
-    });
+  socket.on('disconnect', () => {
+    if (!socket.room) return;
+    const r = rooms[socket.room];
+    
+    delete r.players[socket.id];
+    delete r.scores[socket.id];
+    
+    io.to(socket.room).emit('system', `${socket.nick} oyundan ayrıldı.`);
 
-    // Sohbet ve Tahmin Mesajlarını İşleme
-    socket.on('chat message', (msg) => {
-        if (!socket.room) return;
-        const room = getRoomState(socket.room);
-        const guess = msg.trim().toLowerCase();
-        const correctWord = room.currentWord.toLowerCase();
-        
-        if (socket.id === room.drawerId) {
-             // Çizenin mesajını normal sohbete aktar
-             io.to(socket.room).emit('chat message', `${socket.nickname}: ${msg}`);
-             return;
-        }
-        
-        if (guess === correctWord) {
-            if (room.guessedPlayers.has(socket.id)) {
-                 // Zaten tahmin ettiyse bir şey yapma
-                 io.to(socket.room).emit('chat message', `${socket.nickname}: ${msg}`);
-                 return;
-            }
-            
-            // --- PUANLAMA MANTIĞI ---
-            
-            // 1. Bilene Puan
-            room.score[socket.id] += 5; // Bilene 5 puan
-            room.guessedPlayers.add(socket.id); // Tahmin edenler listesine ekle
-            
-            // 2. Çizene Puan (Kelimeyi bilen herkes çizene 3 puan kazandırır)
-            room.score[room.drawerId] += 3; // Çizene 3 puan
-            
-            
-            io.to(socket.room).emit('system message', `🎉 **${socket.nickname}** kelimeyi bildi! Kelime: **${room.currentWord}**`);
-            updateLeaderboard(socket.room);
-            
-            // Eğer tahmin edenler sayısı (toplam oyuncu - çizen) sayısına ulaşırsa tur bitsin
-            if (room.guessedPlayers.size >= room.playerCount - 1) {
-                io.to(socket.room).emit('system message', `Tüm oyuncular kelimeyi bildi! Yeni tur başlıyor...`);
-                clearInterval(room.interval); // Zamanlayıcıyı durdur
-                setTimeout(() => startNewRound(socket.room), 3000); // 3 saniye sonra yeni tur
-            }
-            
-            // Kelimeyi bilen oyuncu için özel bildirim (Diğer bilmeyenler tahmin etmeye devam etmeli)
-            io.to(socket.id).emit('system message', `Tebrikler! +5 Puan kazandın.`);
-
-        } else {
-            // Yanlış Tahmin veya Normal Sohbet
-            io.to(socket.room).emit('chat message', `${socket.nickname}: ${msg}`);
-        }
-    });
-
-    // Kullanıcı ayrıldığında
-    socket.on('disconnect', () => {
-        if (!socket.room) return;
-        
-        const room = getRoomState(socket.room);
-        const disconnectedNickname = socket.nickname;
-
-        if (room.connections[socket.id]) {
-            delete room.connections[socket.id];
-            room.playerCount--; 
-            
-            io.to(socket.room).emit('system message', `${disconnectedNickname} oyundan ayrıldı.`);
-
-            // Ayrılan kişi çizen ise veya oyuncu sayısı 2'nin altına düşerse
-            if (socket.id === room.drawerId || room.playerCount < 2) {
-                startNewRound(socket.room);
-            } else {
-                 updateLeaderboard(socket.room);
-            }
-        }
-        
-        // Eğer oda tamamen boşalırsa
-        if (room.playerCount <= 0) {
-            delete rooms[socket.room];
-            if (room.interval) clearInterval(room.interval);
-        }
-        updateLobby(); 
-    });
+    // Eğer çizen ayrılırsa veya oyuncu kalmazsa
+    if (Object.keys(r.players).length === 0) {
+      delete rooms[socket.room];
+      if (r.interval) clearInterval(r.interval);
+    } else if (socket.id === r.drawer) {
+      startRound(socket.room); // Çizen ayrılırsa yeni tur başlat
+    }
+    updateLobby();
+  });
 });
 
-// Sunucuyu 3000 portunda başlat
-const PORT = 3000;
-server.listen(PORT, () => {
-  console.log(`Sunucu http://localhost:${PORT} adresinde çalışıyor`);
-});
+// Sunucuyu başlatma (Render'ın sağladığı portu kullanır)
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`Sunucu ${PORT} portunda çalışıyor`));
